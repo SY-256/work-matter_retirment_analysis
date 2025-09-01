@@ -1,0 +1,29 @@
+params = {
+    'objective': 'binary',
+    'metric': ['auc'],
+    'scale_pos_weight': 12,  # 手動調整
+    'boosting_type': 'gbdt',
+    'num_leaves': 31,
+    'learning_rate': 0.02,
+    'min_data_in_leaf': 100,
+    'lambda_l2': 10,
+    'verbose': -1
+    # is_unbalance は使わない
+}
+
+# 極度の不均衡データ用の推奨設定
+recommended_params = {
+    'objective': 'binary',
+    'metric': ['auc'],
+    'scale_pos_weight': 12,  # sqrt(149) ≈ 12
+    'boosting_type': 'gbdt',
+    'num_leaves': 31,
+    'learning_rate': 0.01,  # より慎重に学習
+    'feature_fraction': 0.7,
+    'bagging_fraction': 0.7,
+    'bagging_freq': 5,
+    'min_data_in_leaf': 200,  # 過学習防止
+    'min_gain_to_split': 0.05,
+    'lambda_l2': 20,  # 強い正則化
+    'verbose': -1
+}
