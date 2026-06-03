@@ -232,43 +232,64 @@ def gains_table(
     horizon=HORIZON,
     fracs=(0.01, 0.03, 0.05, 0.10, 0.20, 0.30),
 ):
-    """上位k%(高リスク)ごとに 対象人数・的中率(precision)・lift・捕捉率(recall)・捕捉数 を返す。
-    フォロー工数（=対象人数）と効果（=捕捉数/捕捉率）のトレードオフを見て、回す割合を決める。
+    """上位k%(高リスク)ごとに 対象人数・的中率・lift・捕捉率・捕捉数、および
+    捕捉した退職者が『何ヶ月先に退職するか』(中央値と月別内訳) を返す。
+    退職までが短い人ばかり拾う＝直前で手遅れ、長い人も拾える＝早期で有効、の判断に使える。
     評価は6ヶ月後の状態が確定している行のみ（途中打ち切りは除外）。"""
+    time = np.asarray(time, dtype=float)
     event = np.asarray(event).astype(int)
     obs_h = np.asarray(obs_h)
     pred = np.asarray(pred_time)
     risk = -pred  # 高いほど高リスク
     known = (event == 1) | ((event == 0) & (obs_h >= horizon))
-    y, s = event[known], risk[known]
+    y, s, t = event[known], risk[known], time[known]
     n, total = len(y), int(y.sum())
     base = y.mean() if n else np.nan
     order = np.argsort(-s)  # リスク降順
-    rows = []
+    months = np.arange(1, horizon + 1)
+
+    rows, dist = [], []
     for f in fracs:
         k = max(1, int(round(n * f)))
         sel = order[:k]
-        prec = y[sel].mean()
+        ysel, tsel = y[sel], t[sel]
+        leaver_m = np.round(tsel[ysel == 1]).astype(
+            int
+        )  # 捕捉した退職者の「何ヶ月先か」
         rows.append(
             {
                 "top_frac": f,
                 "n_target": k,
-                "precision": prec,
-                "lift": prec / base if base > 0 else np.nan,
-                "capture": (y[sel].sum() / total) if total > 0 else np.nan,
-                "n_captured": int(y[sel].sum()),
+                "precision": ysel.mean(),
+                "lift": ysel.mean() / base if base > 0 else np.nan,
+                "capture": (ysel.sum() / total) if total > 0 else np.nan,
+                "n_captured": int(ysel.sum()),
+                "median_months": float(np.median(leaver_m))
+                if len(leaver_m)
+                else np.nan,
+                "mean_months": float(leaver_m.mean()) if len(leaver_m) else np.nan,
             }
         )
+        dist.append([int((leaver_m == m).sum()) for m in months])
     gt = pd.DataFrame(rows)
+
     print(f"評価対象(6ヶ月確定)={n}人 / 退職者={total}人 / ベース退職率={base:.1%}")
     print(
-        f"{'上位':>5}{'対象人数':>10}{'的中率':>9}{'lift':>7}{'捕捉率':>9}{'捕捉数':>8}"
+        f"{'上位':>5}{'対象人数':>10}{'的中率':>9}{'lift':>7}{'捕捉率':>9}{'捕捉数':>8}{'退職月中央値':>13}"
     )
     for _, r in gt.iterrows():
+        med = "    -" if np.isnan(r.median_months) else f"{r.median_months:.1f}ヶ月"
         print(
             f"{r.top_frac * 100:>4.0f}%{int(r.n_target):>10}{r.precision:>8.1%}"
-            f"{r.lift:>7.2f}{r.capture:>8.1%}{int(r.n_captured):>8}"
+            f"{r.lift:>7.2f}{r.capture:>8.1%}{int(r.n_captured):>8}{med:>13}"
         )
+
+    print("\n捕捉した退職者の『何ヶ月先に退職か』内訳（人数）")
+    print(f"{'上位':>5}" + "".join(f"{str(m) + 'ヶ月':>7}" for m in months))
+    for f, counts in zip(fracs, dist):
+        print(f"{f * 100:>4.0f}%" + "".join(f"{c:>7}" for c in counts))
+    all_m = np.round(t[y == 1]).astype(int)  # 参考: 全退職者の分布
+    print(f"{'全体':>5}" + "".join(f"{int((all_m == m).sum()):>7}" for m in months))
     return gt
 
 
