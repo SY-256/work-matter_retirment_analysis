@@ -31,6 +31,8 @@ AFT のラベル（区間打ち切り）:
 import numpy as np
 import pandas as pd
 import math
+import io
+import contextlib
 import xgboost as xgb
 
 HORIZON = 6  # 6ヶ月
@@ -531,6 +533,216 @@ def train_aft_forward_cv(
     }
 
 
+def feature_importance_cv(cv, df, feature_cols, top=20, use_shap=True):
+    """前進検証の各fold modelから特徴量重要度を集計（fold間で平均＝安定したものを上位に）。
+      mean_gain     : 平均利得（分割でどれだけ損失を減らしたか）。fold平均。
+      n_folds_used  : その特徴が分割に使われたfold数（安定性の目安）。
+      mean_abs_shap : SHAP寄与の絶対値の平均＝効きの大きさ（向きを問わない総合的な効き）。
+      dir_corr      : 特徴値とSHAP寄与の相関＝効きの向き。AFTは予測生存時間(log)への寄与なので、
+                      正＝値が高いほど在籍を延ばす(低リスク)、負＝値が高いほど早期退職(高リスク)。
+    注意: 重要度はモデルごとに変わる/因果ではない。直前系のリーク特徴が上位に来ていないかも確認。"""
+    folds = cv["folds"]
+    gain_acc = {f: [] for f in feature_cols}
+    for fo in folds:
+        sc = fo["booster"].get_score(importance_type="gain")  # 使われた特徴のみ返る
+        for f in feature_cols:
+            gain_acc[f].append(sc.get(f, 0.0))
+    imp = pd.DataFrame(
+        {
+            "feature": feature_cols,
+            "mean_gain": [float(np.mean(gain_acc[f])) for f in feature_cols],
+            "n_folds_used": [
+                int(np.sum(np.array(gain_acc[f]) > 0)) for f in feature_cols
+            ],
+        }
+    )
+
+    if use_shap:
+        yl, yu = df["y_lower"].to_numpy(), df["y_upper"].to_numpy()
+        Xv = df[feature_cols]
+        F = len(feature_cols)
+        absum = np.zeros(F)
+        Sx = Sy = Sxy = Sxx = Syy = None
+        Sx, Sy, Sxy, Sxx, Syy, ntot = (
+            np.zeros(F),
+            np.zeros(F),
+            np.zeros(F),
+            np.zeros(F),
+            np.zeros(F),
+            0,
+        )
+        try:
+            for fo in folds:
+                va = fo["valid_idx"]
+                d = make_dmatrix(Xv.iloc[va], yl[va], yu[va])
+                c = np.asarray(fo["booster"].predict(d, pred_contribs=True))[
+                    :, :F
+                ]  # 末尾bias除く
+                xv = Xv.iloc[va].to_numpy(dtype=float)
+                absum += np.abs(c).sum(axis=0)
+                Sx += xv.sum(0)
+                Sy += c.sum(0)
+                Sxy += (xv * c).sum(0)
+                Sxx += (xv * xv).sum(0)
+                Syy += (c * c).sum(0)
+                ntot += c.shape[0]
+            imp["mean_abs_shap"] = absum / max(ntot, 1)
+            denom = np.sqrt(
+                np.clip(ntot * Sxx - Sx**2, 0, None)
+                * np.clip(ntot * Syy - Sy**2, 0, None)
+            )
+            with np.errstate(invalid="ignore", divide="ignore"):
+                imp["dir_corr"] = np.where(
+                    denom > 0, (ntot * Sxy - Sx * Sy) / denom, np.nan
+                )
+        except Exception as e:
+            print(f"（SHAPはスキップ: {e}）")
+
+    sort_key = "mean_abs_shap" if "mean_abs_shap" in imp.columns else "mean_gain"
+    imp = imp.sort_values(sort_key, ascending=False).reset_index(drop=True)
+    print(
+        f"=== 特徴量重要度（前進検証 {len(folds)} fold 集計 / {sort_key} 降順 top{top}）==="
+    )
+    if "dir_corr" in imp.columns:
+        print(
+            "  dir_corr 符号: 正=値が高いほど在籍↑(低リスク) / 負=値が高いほど早期退職↑(高リスク)"
+        )
+    print(imp.head(top).round(4).to_string(index=False))
+    return imp
+
+
+def _set_cjk_font(matplotlib):
+    """日本語が含まれる特徴名でも文字化けしないよう、利用可能なCJKフォントを設定。"""
+    from matplotlib import font_manager
+
+    for name in [
+        "Noto Sans CJK JP",
+        "IPAexGothic",
+        "IPAPGothic",
+        "TakaoPGothic",
+        "Yu Gothic",
+        "Meiryo",
+        "Hiragino Sans",
+        "MS Gothic",
+        "Noto Sans CJK JP Regular",
+    ]:
+        try:
+            font_manager.findfont(name, fallback_to_default=False)
+            matplotlib.rcParams["font.family"] = name
+            break
+        except Exception:
+            continue
+    matplotlib.rcParams["axes.unicode_minus"] = False
+
+
+def shap_dependence_plots(
+    cv,
+    df,
+    feature_cols,
+    features=None,
+    top_k=6,
+    max_points=3000,
+    path="shap_dependence.png",
+    seed=0,
+):
+    """SHAP依存プロット（特徴値 vs SHAP寄与の散布）を保存する。
+    y>0 = 在籍を延ばす方向(低リスク) / y<0 = 早期退職を強める方向(高リスク)。
+    features 未指定なら mean|SHAP| 上位 top_k を自動選択。"""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    _set_cjk_font(matplotlib)
+    import matplotlib.pyplot as plt
+
+    folds = cv["folds"]
+    yl, yu = df["y_lower"].to_numpy(), df["y_upper"].to_numpy()
+    Xv = df[feature_cols]
+    F = len(feature_cols)
+    vals_list, contr_list = [], []
+    for fo in folds:
+        va = fo["valid_idx"]
+        d = make_dmatrix(Xv.iloc[va], yl[va], yu[va])
+        c = np.asarray(fo["booster"].predict(d, pred_contribs=True))[
+            :, :F
+        ]  # 末尾bias除く
+        vals_list.append(Xv.iloc[va].to_numpy(dtype=float))
+        contr_list.append(c)
+    V = np.concatenate(vals_list)
+    C = np.concatenate(contr_list)
+
+    if features is None:
+        order = np.argsort(-np.abs(C).mean(0))
+        sel = [feature_cols[i] for i in order[:top_k]]
+    else:
+        sel = list(features)
+    idx_of = {f: i for i, f in enumerate(feature_cols)}
+
+    rng = np.random.default_rng(seed)
+    N = V.shape[0]
+    ridx = (
+        rng.choice(N, size=min(max_points, N), replace=False)
+        if N > max_points
+        else np.arange(N)
+    )
+
+    m = len(sel)
+    ncol = min(3, m)
+    nrow = int(np.ceil(m / ncol))
+    fig, axes = plt.subplots(
+        nrow, ncol, figsize=(4.3 * ncol, 3.4 * nrow), squeeze=False
+    )
+    for i, f in enumerate(sel):
+        ax = axes[i // ncol][i % ncol]
+        j = idx_of[f]
+        x, y = V[ridx, j], C[ridx, j]
+        ax.scatter(x, y, s=8, alpha=0.3, edgecolors="none")
+        ax.axhline(0, color="grey", lw=0.8)
+        r = np.corrcoef(x, y)[0, 1] if (np.std(x) > 0 and np.std(y) > 0) else np.nan
+        ax.set_title(f"{f}  (dir_corr={r:.2f})", fontsize=10)
+        ax.set_xlabel(f, fontsize=9)
+        ax.set_ylabel("SHAP寄与 (正=低リスク)", fontsize=9)
+    for k in range(m, nrow * ncol):
+        axes[k // ncol][k % ncol].axis("off")
+    fig.tight_layout()
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+    print(f"SHAP依存プロットを保存: {path}（特徴: {', '.join(sel)}）")
+    return path
+
+
+def compare_reduced_model(df, full_feats, top_feats, cv_full=None, **cv_kwargs):
+    """フル特徴 vs 上位特徴のみ で、全fold併合の総合評価(C-index/AUC/AP/lift@10%)を比較。
+    cv_full に既存の train_aft_forward_cv 結果を渡せば、フル側は再学習せず流用する。"""
+
+    def silent(fn, *a, **k):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return fn(*a, **k)
+
+    if cv_full is None:
+        cv_full = silent(train_aft_forward_cv, df, full_feats, **cv_kwargs)
+    cv_red = silent(train_aft_forward_cv, df, top_feats, **cv_kwargs)
+
+    def lift10(c):
+        g = c["pooled_gains"]
+        r = g.loc[g["top_frac"] == 0.10, "lift"]
+        return float(r.iloc[0]) if len(r) else np.nan
+
+    print("=== フル特徴 vs 上位特徴のみ（全fold併合の総合評価）===")
+    print(
+        f"{'モデル':>10}{'特徴数':>7}{'C-index':>9}{'AUC':>8}{'AP':>8}{'lift@10%':>10}"
+    )
+    for tag, c, feats in [
+        ("full", cv_full, full_feats),
+        (f"top{len(top_feats)}", cv_red, top_feats),
+    ]:
+        mm = c["pooled_metrics"]
+        print(
+            f"{tag:>10}{len(feats):>7}{mm['c_index']:>9.3f}"
+            f"{_f(mm.get('auc_6m')):>8}{_f(mm.get('ap_6m')):>8}{_f(lift10(c), '.2f'):>10}"
+        )
+    return {"full": cv_full, "reduced": cv_red}
+
+
 def evaluate_with_model(
     bst,
     df,
@@ -803,3 +1015,18 @@ if __name__ == "__main__":
         sigma=DEFAULT_PARAMS["aft_loss_distribution_scale"],
         dist=DEFAULT_PARAMS["aft_loss_distribution"],
     )
+
+    # どの特徴量が効いているか（fold集計の gain ＋ SHAPの大きさ・向き）
+    print()
+    imp = feature_importance_cv(cv, labeled, feats, top=10)
+
+    # SHAP依存プロット（特徴値 vs 寄与）を保存
+    print()
+    shap_dependence_plots(
+        cv, labeled, feats, top_k=4, path="/home/claude/shap_dependence.png"
+    )
+
+    # 上位特徴のみで組み直した軽量モデルと、フル特徴の精度比較
+    print()
+    top_feats = imp.head(2)["feature"].tolist()
+    compare_reduced_model(labeled, feats, top_feats, cv_full=cv)
