@@ -30,6 +30,7 @@ AFT のラベル（区間打ち切り）:
 
 import numpy as np
 import pandas as pd
+import math
 import xgboost as xgb
 
 HORIZON = 6  # 6ヶ月
@@ -293,11 +294,104 @@ def gains_table(
     return gt
 
 
+_erf = np.vectorize(math.erf)
+
+
+def survival_prob_within(pred_time, months=(1, 3, 6), sigma=1.0, dist="normal"):
+    """AFTの予測生存時間から「k ヶ月以内に退職する確率 P(T<=k)」を計算する。
+    AFTは log(T) = f(x) + σ·Z（Z は dist 分布）なので、pred = exp(f(x)) として
+        P(T<=k) = F_Z( (ln k - ln pred) / σ )
+    pred_time : bst.predict(...) の出力（基準月からの予測生存月数）。
+    months    : 評価する月数。単一(例 4)でもリスト(例 [1,3,4,6])でも可。
+    sigma,dist: 学習時の aft_loss_distribution_scale / aft_loss_distribution に必ず合わせる。
+    返り値    : DataFrame（列 'P_within_{k}m'）。値が大きいほど k ヶ月以内に辞める確率が高い。
+
+    注意: 同じ pred・σ なら、どの k でも社員の『並び順』は同じになる（横軸kは確率の高さを
+          変えるだけで、順位は predict と一致）。閾値設定や確率の提示には使えるが、
+          「4ヶ月以内」と「6ヶ月以内」で違う人が上位に来るわけではない点に注意。"""
+    pred = np.clip(np.asarray(pred_time, dtype=float), 1e-12, None)
+    logp = np.log(pred)
+
+    def cdf(z):
+        z = np.clip(z, -50.0, 50.0)
+        if dist == "normal":
+            return 0.5 * (1.0 + _erf(z / np.sqrt(2.0)))
+        if dist == "logistic":
+            return 0.5 * (1.0 + np.tanh(z / 2.0))  # ロジスティックCDF（数値安定形）
+        if dist == "extreme":
+            return 1.0 - np.exp(-np.exp(z))  # 最小値型 Gumbel
+        raise ValueError("dist は 'normal' / 'logistic' / 'extreme' のいずれか")
+
+    cols = {}
+    for k in [float(k) for k in np.atleast_1d(months)]:
+        name = f"P_within_{int(k) if float(k).is_integer() else k}m"
+        cols[name] = cdf((np.log(k) - logp) / sigma)
+    return pd.DataFrame(cols)
+
+
+def calibration_check(
+    pred_time, time, event, obs_h, k=6, sigma=1.0, dist="normal", n_bins=10
+):
+    """P(T<=k) の校正チェック。予測確率をビンに分け、各ビンの『予測平均』vs『実測退職率』を比較。
+    打ち切り考慮: k ヶ月時点の状態が確定している行のみ使用（event 観測、または obs_h>=k）。
+    ECE(期待校正誤差)= Σ (ビン人数/全体) × |予測平均 − 実測|。小さいほどよく校正されている。"""
+    p = (
+        survival_prob_within(pred_time, months=[k], sigma=sigma, dist=dist)
+        .iloc[:, 0]
+        .to_numpy()
+    )
+    time = np.asarray(time, dtype=float)
+    event = np.asarray(event).astype(int)
+    obs_h = np.asarray(obs_h, dtype=float)
+    known = (event == 1) | (obs_h >= k)
+    p, y = p[known], ((event[known] == 1) & (time[known] <= k)).astype(int)
+    n = len(p)
+    if n == 0:
+        print(f"k={k}: {k}ヶ月時点の状態が確定した行が無く校正できません。")
+        return None
+    try:
+        bins = pd.qcut(
+            p, q=max(2, min(n_bins, n // 30)), duplicates="drop"
+        )  # 等頻度ビン
+    except Exception:
+        bins = pd.cut(p, bins=min(n_bins, 10))
+    dfc = pd.DataFrame({"p": p, "y": y, "bin": bins})
+    tab = (
+        dfc.groupby("bin", observed=True)
+        .agg(n=("y", "size"), pred=("p", "mean"), obs=("y", "mean"))
+        .reset_index(drop=True)
+    )
+    ece = float((tab["n"] / n * (tab["pred"] - tab["obs"]).abs()).sum())
+
+    print(f"=== 校正チェック  P(T<={k}ヶ月)  確定{n}人 / 実測退職率{y.mean():.1%} ===")
+    print(f"{'ビン':>4}{'人数':>8}{'予測平均':>11}{'実測退職率':>13}")
+    for i, r in tab.iterrows():
+        print(f"{i + 1:>4}{int(r.n):>8}{r.pred:>10.1%}{r.obs:>12.1%}")
+    print(
+        f"全体: 予測平均={p.mean():.1%}  実測={y.mean():.1%}  ECE={ece:.3f}"
+        f"  （予測>実測なら過大評価 / 予測<実測なら過小評価）"
+    )
+    return tab
+
+
 def make_dmatrix(X, y_lower, y_upper, weight=None):
     d = xgb.DMatrix(X, weight=weight)
     d.set_float_info("label_lower_bound", y_lower)
     d.set_float_info("label_upper_bound", y_upper)
     return d
+
+
+def _predict(bst, dmat):
+    """学習済み booster で予測（xgboost 1.2.1 と新しい版の両対応）。"""
+    if hasattr(bst, "best_ntree_limit"):
+        return bst.predict(
+            dmat, ntree_limit=bst.best_ntree_limit
+        )  # xgboost 1.x（対象）
+    if hasattr(bst, "best_iteration"):
+        return bst.predict(
+            dmat, iteration_range=(0, bst.best_iteration + 1)
+        )  # 1.4+/2.x/3.x
+    return bst.predict(dmat)
 
 
 # ----------------------------------------------------------------------
@@ -311,70 +405,78 @@ def train_aft_forward_cv(
     num_boost_round=400,
     early_stopping_rounds=30,
     use_inverse_count_weight=True,
+    gains_fracs=(0.01, 0.03, 0.05, 0.10, 0.20, 0.30),
 ):
-    params = params or {
-        "objective": "survival:aft",
-        "eval_metric": "aft-nloglik",
-        "aft_loss_distribution": "normal",  # normal / logistic / extreme
-        "aft_loss_distribution_scale": 1.0,  # σ。要チューニング
-        "tree_method": "hist",  # AFT は hist を使う
-        "learning_rate": 0.05,
-        "max_depth": 4,
-        "min_child_weight": 8,
-        "subsample": 0.8,
-        "colsample_bytree": 0.8,
-        "lambda": 1.0,
-    }
+    """前進検証。各カットオフ月で「その月より前(エンバーゴ込み)」で学習し、その月を検証。
+    返り値 dict:
+      folds         : 各foldの {cutoff_yyyymm, booster, valid_idx, pred, metrics}
+      fold_metrics  : foldごとの指標（平均±SDの元）
+      pooled_metrics / pooled_gains : 全foldの out-of-sample 予測を併合した総合評価
+                      （＝前進検証で学習したモデル群による、もれのない評価＋しきい値別gains）
+    学習済みモデルは folds[i]["booster"] で取り出して再利用できる。
+    """
+    params = (params or DEFAULT_PARAMS).copy()
     X = df[feature_cols]
     yl, yu = df["y_lower"].to_numpy(), df["y_upper"].to_numpy()
     time, event = df["time"].to_numpy(), df["event"].to_numpy()
     ref = df["ref_idx"].to_numpy()  # 連番月インデックス（YYYYMMから変換済み）
     obs_h = df["obs_h"].to_numpy()
 
-    metrics = []
+    folds, pooled_idx, pooled_pred = [], [], []
     for v, tr, va in forward_chaining_splits(ref):
+        # 早期終了の内部valid＝学習内の最新スロット（時系列順。検証fold va は使わない）
+        tr_ref = ref[tr]
+        if len(np.unique(tr_ref)) >= 2:
+            es_slot = tr_ref.max()
+            fit = tr[tr_ref < es_slot]
+            es = tr[tr_ref == es_slot]
+        else:
+            fit, es = tr, None
         w = None
         if use_inverse_count_weight:
             # 同一従業員が多スロットで過剰寄与するのを抑える（学習fold内のみ）
-            cnt = df.iloc[tr].groupby(group_col)[group_col].transform("size").to_numpy()
+            cnt = (
+                df.iloc[fit].groupby(group_col)[group_col].transform("size").to_numpy()
+            )
             w = 1.0 / cnt
-        dtr = make_dmatrix(X.iloc[tr], yl[tr], yu[tr], weight=w)
+        dfit = make_dmatrix(X.iloc[fit], yl[fit], yu[fit], weight=w)
         dva = make_dmatrix(X.iloc[va], yl[va], yu[va])
-
-        bst = xgb.train(
-            params,
-            dtr,
-            num_boost_round=num_boost_round,
-            evals=[(dtr, "train"), (dva, "valid")],
-            early_stopping_rounds=early_stopping_rounds,
-            verbose_eval=False,
-        )
-        # xgboost 1.2.1 は best_ntree_limit / ntree_limit を使う。新しい版は iteration_range。
-        if hasattr(bst, "best_ntree_limit"):
-            pred = bst.predict(
-                dva, ntree_limit=bst.best_ntree_limit
-            )  # xgboost 1.x（対象）
-            best_round = bst.best_ntree_limit
-        elif hasattr(bst, "best_iteration"):
-            pred = bst.predict(
-                dva, iteration_range=(0, bst.best_iteration + 1)
-            )  # 1.4+/2.x/3.x
-            best_round = bst.best_iteration + 1
+        if es is not None:
+            des = make_dmatrix(X.iloc[es], yl[es], yu[es])
+            bst = xgb.train(
+                params,
+                dfit,
+                num_boost_round=num_boost_round,
+                evals=[(des, "es")],
+                early_stopping_rounds=early_stopping_rounds,
+                verbose_eval=False,
+            )
         else:
-            pred = bst.predict(dva)
-            best_round = num_boost_round
-
+            bst = xgb.train(params, dfit, num_boost_round=num_boost_round)
+        pred = _predict(bst, dva)
         m = evaluate_survival(
             time[va], event[va], obs_h[va], pred, horizon=HORIZON, top_frac=0.10
         )
-        metrics.append(m)
         v_ym = int(index_to_yyyymm(v))  # 表示用に YYYYMM へ戻す
+        folds.append(
+            {
+                "cutoff_yyyymm": v_ym,
+                "train_cutoff_idx": int(v) - HORIZON,
+                "booster": bst,
+                "valid_idx": va,
+                "pred": pred,
+                "metrics": m,
+            }
+        )
+        pooled_idx.append(va)
+        pooled_pred.append(pred)
         print(
             f"cutoff={v_ym}  valid={len(va):>4}行(6ヶ月確定{m['n_binary']:>4}/退職率{_p(m['pos_rate'])})  "
             f"C-index={_f(m['c_index'])}  AUC={_f(m.get('auc_6m'))}  AP={_f(m.get('ap_6m'))}  "
             f"lift@10%={_f(m.get('lift_top10'), '.2f')}  capture@10%={_p(m.get('capture_top10'))}"
         )
 
+    fold_metrics = [f["metrics"] for f in folds]
     print("\n=== 前進検証 平均（fold間） ===")
     for k, label in [
         ("c_index", "C-index"),
@@ -383,16 +485,94 @@ def train_aft_forward_cv(
         ("lift_top10", "lift@上位10%"),
         ("capture_top10", "capture@上位10%"),
     ]:
-        vals = np.array([mm.get(k, np.nan) for mm in metrics], dtype=float)
+        vals = np.array([mm.get(k, np.nan) for mm in fold_metrics], dtype=float)
         if np.all(np.isnan(vals)):
             continue
         print(f"  {label:18s}: {np.nanmean(vals):.3f} ± {np.nanstd(vals):.3f}")
-    base = np.nanmean([mm.get("pos_rate", np.nan) for mm in metrics])
+    base = np.nanmean([mm.get("pos_rate", np.nan) for mm in fold_metrics])
     print(
         f"  （参考）6ヶ月退職率(ベースライン) ≈ {base:.1%}"
         f"  ※AP はこれを上回ると有用 / lift は 1.0 が無情報"
     )
-    return metrics
+
+    # 全foldの out-of-sample 予測を併合 ＝ 前進検証で学習したモデル群による総合評価
+    all_idx = np.concatenate(pooled_idx)
+    all_pred = np.concatenate(pooled_pred)
+    print(
+        "\n=== 全fold併合（前進検証モデルによる out-of-sample 総合評価）＋ しきい値別 gains ==="
+    )
+    pooled_metrics = evaluate_survival(
+        time[all_idx], event[all_idx], obs_h[all_idx], all_pred, horizon=HORIZON
+    )
+    print(
+        f"C-index={_f(pooled_metrics['c_index'])}  AUC={_f(pooled_metrics.get('auc_6m'))}  "
+        f"AP={_f(pooled_metrics.get('ap_6m'))}\n"
+    )
+    pooled_gains = gains_table(
+        time[all_idx],
+        event[all_idx],
+        obs_h[all_idx],
+        all_pred,
+        horizon=HORIZON,
+        fracs=gains_fracs,
+    )
+    pooled = {
+        "pred": all_pred,
+        "time": time[all_idx],
+        "event": event[all_idx],
+        "obs_h": obs_h[all_idx],
+    }
+    return {
+        "folds": folds,
+        "fold_metrics": fold_metrics,
+        "pooled": pooled,
+        "pooled_metrics": pooled_metrics,
+        "pooled_gains": pooled_gains,
+    }
+
+
+def evaluate_with_model(
+    bst,
+    df,
+    feature_cols,
+    test_ref_months,
+    horizon=HORIZON,
+    gains_fracs=(0.01, 0.03, 0.05, 0.10, 0.20, 0.30),
+    train_cutoff_idx=None,
+):
+    """学習済み booster を使い、指定した基準月の断面を評価（再学習しない）。
+    train_aft_forward_cv の folds[i]["booster"] や fit_final_model の戻り値をそのまま渡せる。
+    train_cutoff_idx を渡すと、評価断面が学習に含まれていないか（リーク）を確認して警告する。"""
+    ref = df["ref_idx"].to_numpy()
+    test_idx_list = [
+        int(yyyymm_to_index(m)) for m in np.atleast_1d(test_ref_months).tolist()
+    ]
+    te = np.where(np.isin(ref, test_idx_list))[0]
+    if len(te) == 0:
+        raise ValueError("評価対象の断面が空です。test_ref_months を確認してください。")
+    if train_cutoff_idx is not None and min(test_idx_list) <= train_cutoff_idx:
+        print(
+            "⚠ 警告: 評価断面が学習期間に含まれています（リークの可能性）。"
+            "学習カットオフより後の基準月を指定してください。"
+        )
+    yl, yu = df["y_lower"].to_numpy(), df["y_upper"].to_numpy()
+    time, event, obs_h = (
+        df["time"].to_numpy(),
+        df["event"].to_numpy(),
+        df["obs_h"].to_numpy(),
+    )
+    pred = _predict(bst, make_dmatrix(df[feature_cols].iloc[te], yl[te], yu[te]))
+
+    yms = "・".join(str(int(index_to_yyyymm(i))) for i in sorted(test_idx_list))
+    print(f"=== 学習済みモデルで評価（test=基準月 {yms} / 再学習なし） ===")
+    m = evaluate_survival(time[te], event[te], obs_h[te], pred, horizon=horizon)
+    print(
+        f"C-index={_f(m['c_index'])}  AUC={_f(m.get('auc_6m'))}  AP={_f(m.get('ap_6m'))}\n"
+    )
+    gt = gains_table(
+        time[te], event[te], obs_h[te], pred, horizon=horizon, fracs=gains_fracs
+    )
+    return {"pred": pred, "metrics": m, "gains": gt}
 
 
 def evaluate_holdout_by_time(
@@ -578,17 +758,48 @@ if __name__ == "__main__":
 
     # emp_id, ref_month は特徴量に入れない（個人の丸暗記・時刻の取り込みを避ける）
     feats = ["overtime", "stress", "tenure", "noise"]
-    print("【1】前進検証（各スロットを順に検証）")
-    train_aft_forward_cv(labeled, feats)
-
-    print(
-        "\n【2】時系列ホールドアウト（指定した基準月の断面を学習に使わず評価）＋ しきい値別 gains"
+    print("【1】前進検証（各スロットを検証）＋ 全fold併合の総合評価/gains")
+    cv = train_aft_forward_cv(
+        labeled, feats, gains_fracs=(0.01, 0.03, 0.05, 0.10, 0.20, 0.30)
     )
-    # 評価する断面は基準月(YYYYMM)で指定。None=最新 / 単一 / リスト いずれも可。
-    # 例) 直近3ヶ月をまとめて評価: test_ref_months=[202410, 202411, 202412]
-    evaluate_holdout_by_time(
+    print(
+        f"\n学習済みモデルは cv['folds'][i]['booster'] で再利用可能（{len(cv['folds'])}個）。"
+    )
+
+    # 例: 最初のfold（最も古い時点）のモデルを、後の未知断面に再利用して評価（再学習なし）
+    f0 = cv["folds"][0]
+    later_ym = cv["folds"][-1]["cutoff_yyyymm"]
+    print(
+        f"\nfold(cutoff={f0['cutoff_yyyymm']})のモデルを、後の断面 {later_ym} に再利用:"
+    )
+    res = evaluate_with_model(
+        f0["booster"],
         labeled,
         feats,
-        test_ref_months=202412,
-        gains_fracs=(0.01, 0.03, 0.05, 0.10, 0.20, 0.30),
+        test_ref_months=later_ym,
+        train_cutoff_idx=f0["train_cutoff_idx"],
+        gains_fracs=(0.05, 0.10, 0.20),
+    )
+
+    # 予測生存時間から「kヶ月以内に退職する確率」スコアを出す
+    probs = survival_prob_within(
+        res["pred"],
+        months=[1, 3, 4, 6],
+        sigma=DEFAULT_PARAMS["aft_loss_distribution_scale"],
+        dist=DEFAULT_PARAMS["aft_loss_distribution"],
+    )
+    print("\n各社員の『kヶ月以内に退職する確率』スコア（先頭5件）")
+    print(probs.head().round(3).to_string(index=False))
+
+    # P(T<=k) の校正チェック（全fold併合の予測で k=6ヶ月）
+    print()
+    pc = cv["pooled"]
+    calibration_check(
+        pc["pred"],
+        pc["time"],
+        pc["event"],
+        pc["obs_h"],
+        k=6,
+        sigma=DEFAULT_PARAMS["aft_loss_distribution_scale"],
+        dist=DEFAULT_PARAMS["aft_loss_distribution"],
     )
