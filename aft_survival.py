@@ -533,14 +533,19 @@ def train_aft_forward_cv(
     }
 
 
-def feature_importance_cv(cv, df, feature_cols, top=20, use_shap=True):
+def feature_importance_cv(
+    cv, df, feature_cols, top=20, use_shap=True, shap_sample=None, seed=0
+):
     """前進検証の各fold modelから特徴量重要度を集計（fold間で平均＝安定したものを上位に）。
       mean_gain     : 平均利得（分割でどれだけ損失を減らしたか）。fold平均。
       n_folds_used  : その特徴が分割に使われたfold数（安定性の目安）。
       mean_abs_shap : SHAP寄与の絶対値の平均＝効きの大きさ（向きを問わない総合的な効き）。
       dir_corr      : 特徴値とSHAP寄与の相関＝効きの向き。AFTは予測生存時間(log)への寄与なので、
                       正＝値が高いほど在籍を延ばす(低リスク)、負＝値が高いほど早期退職(高リスク)。
-    注意: 重要度はモデルごとに変わる/因果ではない。直前系のリーク特徴が上位に来ていないかも確認。"""
+    shap_sample : None=各foldの検証行で算出。整数を渡すと「最終fold(最も学習データが多い)モデル」で
+                  全行からその件数をサンプルして算出する。特徴が変動しやすくなり dir_corr の NaN が減る。
+    注意: dir_corr が NaN = その特徴が「評価行で値が一定」または「モデルに未使用で寄与が常に0」で、
+          向きが定義できない状態。多くは実質無効な特徴。重要度はモデルごとに変わる/因果ではない。"""
     folds = cv["folds"]
     gain_acc = {f: [] for f in feature_cols}
     for fo in folds:
@@ -561,8 +566,17 @@ def feature_importance_cv(cv, df, feature_cols, top=20, use_shap=True):
         yl, yu = df["y_lower"].to_numpy(), df["y_upper"].to_numpy()
         Xv = df[feature_cols]
         F = len(feature_cols)
+        # dir_corr は特徴が「変動」しないと定義できない。検証行だけだと定数になりがちなので、
+        # shap_sample 指定時は最終foldモデルで全行からサンプルし、変動を確保する。
+        if shap_sample is None:
+            rows_iter = [(fo["booster"], fo["valid_idx"]) for fo in folds]
+        else:
+            bst_last, n = folds[-1]["booster"], len(df)
+            idx = np.random.default_rng(seed).choice(
+                n, size=min(int(shap_sample), n), replace=False
+            )
+            rows_iter = [(bst_last, idx)]
         absum = np.zeros(F)
-        Sx = Sy = Sxy = Sxx = Syy = None
         Sx, Sy, Sxy, Sxx, Syy, ntot = (
             np.zeros(F),
             np.zeros(F),
@@ -572,14 +586,13 @@ def feature_importance_cv(cv, df, feature_cols, top=20, use_shap=True):
             0,
         )
         try:
-            for fo in folds:
-                va = fo["valid_idx"]
-                d = make_dmatrix(Xv.iloc[va], yl[va], yu[va])
-                c = np.asarray(fo["booster"].predict(d, pred_contribs=True))[
+            for bst_i, rows in rows_iter:
+                d = make_dmatrix(Xv.iloc[rows], yl[rows], yu[rows])
+                c = np.asarray(bst_i.predict(d, pred_contribs=True))[
                     :, :F
                 ]  # 末尾bias除く
-                xv = Xv.iloc[va].to_numpy(dtype=float)
-                absum += np.abs(c).sum(axis=0)
+                xv = Xv.iloc[rows].to_numpy(dtype=float)
+                absum += np.abs(c).sum(0)
                 Sx += xv.sum(0)
                 Sy += c.sum(0)
                 Sxy += (xv * c).sum(0)
@@ -587,13 +600,12 @@ def feature_importance_cv(cv, df, feature_cols, top=20, use_shap=True):
                 Syy += (c * c).sum(0)
                 ntot += c.shape[0]
             imp["mean_abs_shap"] = absum / max(ntot, 1)
-            denom = np.sqrt(
-                np.clip(ntot * Sxx - Sx**2, 0, None)
-                * np.clip(ntot * Syy - Sy**2, 0, None)
-            )
+            vx = ntot * Sxx - Sx**2  # 特徴値のばらつき
+            vy = ntot * Syy - Sy**2  # SHAP寄与のばらつき
+            denom = np.sqrt(np.clip(vx, 0, None) * np.clip(vy, 0, None))
             with np.errstate(invalid="ignore", divide="ignore"):
                 imp["dir_corr"] = np.where(
-                    denom > 0, (ntot * Sxy - Sx * Sy) / denom, np.nan
+                    denom > 1e-12, (ntot * Sxy - Sx * Sy) / denom, np.nan
                 )
         except Exception as e:
             print(f"（SHAPはスキップ: {e}）")
@@ -606,6 +618,7 @@ def feature_importance_cv(cv, df, feature_cols, top=20, use_shap=True):
     if "dir_corr" in imp.columns:
         print(
             "  dir_corr 符号: 正=値が高いほど在籍↑(低リスク) / 負=値が高いほど早期退職↑(高リスク)"
+            " / NaN=値が一定 or 未使用で向き不定"
         )
     print(imp.head(top).round(4).to_string(index=False))
     return imp
