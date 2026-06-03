@@ -34,6 +34,20 @@ import xgboost as xgb
 
 HORIZON = 6  # 6ヶ月
 
+DEFAULT_PARAMS = {
+    "objective": "survival:aft",
+    "eval_metric": "aft-nloglik",
+    "aft_loss_distribution": "normal",  # normal / logistic / extreme
+    "aft_loss_distribution_scale": 1.0,
+    "tree_method": "hist",
+    "learning_rate": 0.05,
+    "max_depth": 4,
+    "min_child_weight": 8,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,  # 高次元なら 0.3-0.5 に下げると過学習に強い
+    "lambda": 1.0,
+}
+
 
 # ----------------------------------------------------------------------
 # 0. YYYYMM(数値) ⇄ 連番の月インデックス
@@ -41,10 +55,11 @@ HORIZON = 6  # 6ヶ月
 #    year*12 + (month-1) のインデックスに直すと、差分が正しく経過月数になる。
 # ----------------------------------------------------------------------
 def yyyymm_to_index(yyyymm):
-    """YYYYMM(数値, 例 202407) → 連番月インデックス。NaN は NaN のまま。スカラ/配列どちらも可。"""
-    a = np.asarray(yyyymm, dtype=float)
-    scalar = a.ndim == 0
-    a = np.atleast_1d(a)
+    """YYYYMM(数値, 例 202407) → 連番月インデックス。スカラ/配列どちらも可。
+    空欄・None・pd.NA・文字列など非数値はすべて NaN に落とす（在職者の退職月NaNもそのままNaN）。"""
+    scalar = np.asarray(yyyymm).ndim == 0
+    arr = np.atleast_1d(np.asarray(yyyymm, dtype=object)).ravel()
+    a = pd.to_numeric(arr, errors="coerce").astype(float)  # 非数値→NaN に強制
     out = np.full(a.shape, np.nan)
     m = ~np.isnan(a)
     yy = (a[m] // 100).astype(int)
@@ -209,6 +224,54 @@ def evaluate_survival(time, event, obs_h, pred_time, horizon=HORIZON, top_frac=0
 # ----------------------------------------------------------------------
 # 4. AFT 用 DMatrix
 # ----------------------------------------------------------------------
+def gains_table(
+    time,
+    event,
+    obs_h,
+    pred_time,
+    horizon=HORIZON,
+    fracs=(0.01, 0.03, 0.05, 0.10, 0.20, 0.30),
+):
+    """上位k%(高リスク)ごとに 対象人数・的中率(precision)・lift・捕捉率(recall)・捕捉数 を返す。
+    フォロー工数（=対象人数）と効果（=捕捉数/捕捉率）のトレードオフを見て、回す割合を決める。
+    評価は6ヶ月後の状態が確定している行のみ（途中打ち切りは除外）。"""
+    event = np.asarray(event).astype(int)
+    obs_h = np.asarray(obs_h)
+    pred = np.asarray(pred_time)
+    risk = -pred  # 高いほど高リスク
+    known = (event == 1) | ((event == 0) & (obs_h >= horizon))
+    y, s = event[known], risk[known]
+    n, total = len(y), int(y.sum())
+    base = y.mean() if n else np.nan
+    order = np.argsort(-s)  # リスク降順
+    rows = []
+    for f in fracs:
+        k = max(1, int(round(n * f)))
+        sel = order[:k]
+        prec = y[sel].mean()
+        rows.append(
+            {
+                "top_frac": f,
+                "n_target": k,
+                "precision": prec,
+                "lift": prec / base if base > 0 else np.nan,
+                "capture": (y[sel].sum() / total) if total > 0 else np.nan,
+                "n_captured": int(y[sel].sum()),
+            }
+        )
+    gt = pd.DataFrame(rows)
+    print(f"評価対象(6ヶ月確定)={n}人 / 退職者={total}人 / ベース退職率={base:.1%}")
+    print(
+        f"{'上位':>5}{'対象人数':>10}{'的中率':>9}{'lift':>7}{'捕捉率':>9}{'捕捉数':>8}"
+    )
+    for _, r in gt.iterrows():
+        print(
+            f"{r.top_frac * 100:>4.0f}%{int(r.n_target):>10}{r.precision:>8.1%}"
+            f"{r.lift:>7.2f}{r.capture:>8.1%}{int(r.n_captured):>8}"
+        )
+    return gt
+
+
 def make_dmatrix(X, y_lower, y_upper, weight=None):
     d = xgb.DMatrix(X, weight=weight)
     d.set_float_info("label_lower_bound", y_lower)
@@ -311,6 +374,98 @@ def train_aft_forward_cv(
     return metrics
 
 
+def evaluate_holdout_by_time(
+    df,
+    feature_cols,
+    test_ref_months=None,
+    group_col="emp_id",
+    params=None,
+    num_boost_round=400,
+    early_stopping_rounds=30,
+    use_inverse_count_weight=True,
+    gains_fracs=(0.01, 0.03, 0.05, 0.10, 0.20, 0.30),
+):
+    """時系列ホールドアウト評価（未知データ＝指定した基準月の断面）。
+      test_ref_months : 評価に使う基準月(YYYYMM)。None=最新スロット。
+                        単一(例 202412)でも、リスト(例 [202410, 202411, 202412])でも指定可。
+      test  : ref が test_ref_months に一致する行。学習には一切使わない。
+      train : ref <= (test の最も古い基準月) - HORIZON（エンバーゴで未来を覗かない）。
+    早期終了の内部validは、学習内の最新スロットを時系列順に使う（testは使わない）。
+    """
+    params = (params or DEFAULT_PARAMS).copy()
+    ref = df["ref_idx"].to_numpy()
+    if test_ref_months is None:
+        test_idx_list = [int(np.max(ref))]
+    else:
+        months = np.atleast_1d(test_ref_months).tolist()
+        test_idx_list = [int(yyyymm_to_index(m)) for m in months]
+    earliest_test = min(test_idx_list)
+    tr_all = np.where(ref <= earliest_test - HORIZON)[0]
+    te = np.where(np.isin(ref, test_idx_list))[0]
+    if len(tr_all) == 0 or len(te) == 0:
+        raise ValueError(
+            "学習またはテストが空です。test_ref_months か HORIZON を確認してください。"
+        )
+
+    # 早期終了の内部valid＝学習内の最新スロット（時系列順、testは使わない）
+    tr_ref = ref[tr_all]
+    if len(np.unique(tr_ref)) >= 2:
+        es_slot = tr_ref.max()
+        fit = tr_all[tr_ref < es_slot]
+        es = tr_all[tr_ref == es_slot]
+    else:
+        fit, es = tr_all, None
+
+    X = df[feature_cols]
+    yl, yu = df["y_lower"].to_numpy(), df["y_upper"].to_numpy()
+    time, event, obs_h = (
+        df["time"].to_numpy(),
+        df["event"].to_numpy(),
+        df["obs_h"].to_numpy(),
+    )
+
+    w = None
+    if use_inverse_count_weight:
+        cnt = df.iloc[fit].groupby(group_col)[group_col].transform("size").to_numpy()
+        w = 1.0 / cnt
+    dfit = make_dmatrix(X.iloc[fit], yl[fit], yu[fit], weight=w)
+    dte = make_dmatrix(X.iloc[te], yl[te], yu[te])
+
+    if es is not None:
+        des = make_dmatrix(X.iloc[es], yl[es], yu[es])
+        bst = xgb.train(
+            params,
+            dfit,
+            num_boost_round=num_boost_round,
+            evals=[(des, "es")],
+            early_stopping_rounds=early_stopping_rounds,
+            verbose_eval=False,
+        )
+    else:
+        bst = xgb.train(params, dfit, num_boost_round=num_boost_round)
+
+    if hasattr(bst, "best_ntree_limit"):
+        pred = bst.predict(dte, ntree_limit=bst.best_ntree_limit)  # xgboost 1.x
+    elif hasattr(bst, "best_iteration"):
+        pred = bst.predict(dte, iteration_range=(0, bst.best_iteration + 1))
+    else:
+        pred = bst.predict(dte)
+
+    test_yms = "・".join(str(int(index_to_yyyymm(i))) for i in sorted(test_idx_list))
+    print(f"=== 時系列ホールドアウト（test=基準月 {test_yms} / 学習には未使用） ===")
+    print(
+        f"学習(fit)={len(fit)}行  早期終了valid={0 if es is None else len(es)}行  test={len(te)}行"
+    )
+    m = evaluate_survival(time[te], event[te], obs_h[te], pred, horizon=HORIZON)
+    print(
+        f"C-index={_f(m['c_index'])}  AUC={_f(m.get('auc_6m'))}  AP={_f(m.get('ap_6m'))}\n"
+    )
+    gt = gains_table(
+        time[te], event[te], obs_h[te], pred, horizon=HORIZON, fracs=gains_fracs
+    )
+    return {"booster": bst, "pred": pred, "metrics": m, "gains": gt}
+
+
 def fit_final_model(df, feature_cols, data_end, params=None, num_boost_round=300):
     """配備用: ラベルが確定している行(基準月 <= data_end の6ヶ月前)だけで全学習。
     data_end は YYYYMM(数値)。現職者のスコアリングは、最新スロットの行（ラベル未確定=これから
@@ -402,4 +557,17 @@ if __name__ == "__main__":
 
     # emp_id, ref_month は特徴量に入れない（個人の丸暗記・時刻の取り込みを避ける）
     feats = ["overtime", "stress", "tenure", "noise"]
+    print("【1】前進検証（各スロットを順に検証）")
     train_aft_forward_cv(labeled, feats)
+
+    print(
+        "\n【2】時系列ホールドアウト（指定した基準月の断面を学習に使わず評価）＋ しきい値別 gains"
+    )
+    # 評価する断面は基準月(YYYYMM)で指定。None=最新 / 単一 / リスト いずれも可。
+    # 例) 直近3ヶ月をまとめて評価: test_ref_months=[202410, 202411, 202412]
+    evaluate_holdout_by_time(
+        labeled,
+        feats,
+        test_ref_months=202412,
+        gains_fracs=(0.01, 0.03, 0.05, 0.10, 0.20, 0.30),
+    )
