@@ -723,6 +723,157 @@ def shap_dependence_plots(
     return path
 
 
+def shap_summary_plot(
+    cv,
+    df,
+    feature_cols,
+    top=15,
+    shap_sample=3000,
+    path="shap_summary.png",
+    seed=0,
+    plot_type="dot",
+):
+    """shap ライブラリで SHAP summary plot を描画・保存する（最終fold＝最も学習データが多いモデル）。
+    SHAP値は予測生存時間(log)への寄与: 正=在籍を延ばす(低リスク) / 負=早期退職(高リスク)。
+    plot_type='dot'(beeswarm) / 'bar'(平均|SHAP|) など。shap が無ければ内製版へ自動切替。"""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    _set_cjk_font(matplotlib)
+    import matplotlib.pyplot as plt
+
+    try:
+        import shap
+    except Exception as e:
+        print(f"（shap が読み込めないため内製版に切替: {e}）")
+        return _shap_summary_plot_fallback(
+            cv, df, feature_cols, top, shap_sample, path, seed
+        )
+
+    folds = cv["folds"]
+    n = len(df)
+    rows = (
+        np.random.default_rng(seed).choice(
+            n, size=min(int(shap_sample), n), replace=False
+        )
+        if shap_sample
+        else np.concatenate([fo["valid_idx"] for fo in folds])
+    )
+    X = df[feature_cols].iloc[rows]
+    explainer = shap.TreeExplainer(
+        folds[-1]["booster"]
+    )  # AFTの生margin(log生存時間)への寄与
+    try:
+        sv = explainer.shap_values(X, check_additivity=False)
+    except TypeError:
+        sv = explainer.shap_values(X)
+
+    plt.figure()
+    shap.summary_plot(sv, X, max_display=top, show=False, plot_type=plot_type)
+    try:
+        plt.gca().set_xlabel(
+            "SHAP値（正=在籍↑/低リスク, 負=早期退職/高リスク）", fontsize=9
+        )
+    except Exception:
+        pass
+    plt.tight_layout()
+    plt.savefig(path, dpi=120, bbox_inches="tight")
+    plt.close("all")
+    print(f"SHAP summary plot を保存: {path}（shap使用 / 特徴 上位{top}）")
+    return path
+
+
+def _beeswarm_y(x, center, half=0.38, nbins=100, seed=0):
+    """SHAP summary plot 用に、点を密度に応じて縦方向に散らした y 座標を返す。"""
+    x = np.asarray(x, dtype=float)
+    n = len(x)
+    y = np.full(n, float(center))
+    if n <= 1:
+        return y
+    lo, hi = np.percentile(x, 1), np.percentile(x, 99)
+    if hi <= lo:
+        hi = lo + 1e-9
+    edges = np.linspace(lo, hi, nbins + 1)
+    binidx = np.clip(np.digitize(x, edges) - 1, 0, nbins - 1)
+    counts = np.bincount(binidx, minlength=nbins)
+    maxc = max(counts.max(), 1)
+    rng = np.random.default_rng(seed)
+    for b in range(nbins):
+        sel = np.where(binidx == b)[0]
+        k = len(sel)
+        if k <= 1:
+            continue
+        width = half * np.sqrt(counts[b] / maxc)  # 密度が高い帯ほど太く
+        offs = np.linspace(-1, 1, k)
+        rng.shuffle(offs)  # 色の縞を防ぐ
+        y[sel] = center + offs * width
+    return y
+
+
+def _shap_summary_plot_fallback(
+    cv, df, feature_cols, top=15, shap_sample=3000, path="shap_summary.png", seed=0
+):
+    """[fallback] shap ライブラリが無い場合に matplotlib だけで beeswarm を描画・保存する。
+    各特徴の SHAP 値の分布を点で示し、色＝特徴値(低→高)。横軸 SHAP 値は
+    正＝在籍を延ばす(低リスク)方向 / 負＝早期退職(高リスク)方向。
+    特徴は mean|SHAP| の大きい順に上から並ぶ。最終fold(最も学習データが多い)モデルで算出。"""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    _set_cjk_font(matplotlib)
+    import matplotlib.pyplot as plt
+
+    folds = cv["folds"]
+    yl, yu = df["y_lower"].to_numpy(), df["y_upper"].to_numpy()
+    Xv = df[feature_cols]
+    F = len(feature_cols)
+    n = len(df)
+    rows = (
+        np.random.default_rng(seed).choice(
+            n, size=min(int(shap_sample), n), replace=False
+        )
+        if shap_sample
+        else np.concatenate([fo["valid_idx"] for fo in folds])
+    )
+    bst = folds[-1]["booster"]
+    C = np.asarray(
+        bst.predict(make_dmatrix(Xv.iloc[rows], yl[rows], yu[rows]), pred_contribs=True)
+    )[:, :F]
+    Xvals = Xv.iloc[rows].to_numpy(dtype=float)
+
+    order = np.argsort(-np.abs(C).mean(0))[:top]
+    sel_feats = [feature_cols[i] for i in order]
+    L = len(order)
+
+    fig, ax = plt.subplots(figsize=(8.5, 0.45 * L + 1.5))
+    cmap = plt.cm.coolwarm
+    for row_pos, fi in enumerate(order):
+        ycenter = L - 1 - row_pos  # 重要な特徴ほど上
+        sv, xv = C[:, fi], Xvals[:, fi]
+        yy = _beeswarm_y(sv, ycenter, seed=seed)
+        lo, hi = np.nanpercentile(xv, 5), np.nanpercentile(xv, 95)
+        cn = np.clip((xv - lo) / (hi - lo), 0, 1) if hi > lo else np.full_like(xv, 0.5)
+        ax.scatter(sv, yy, c=cn, cmap=cmap, s=9, alpha=0.6, edgecolors="none")
+    ax.axvline(0, color="grey", lw=0.8)
+    ax.set_yticks(range(L))
+    ax.set_yticklabels([sel_feats[L - 1 - i] for i in range(L)])
+    ax.set_xlabel(
+        "SHAP値（正=在籍を延ばす/低リスク, 負=早期退職/高リスク）", fontsize=9
+    )
+    ax.set_ylim(-0.6, L - 0.4)
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0, 1))
+    sm.set_array([])
+    cb = fig.colorbar(sm, ax=ax, fraction=0.03, pad=0.01)
+    cb.set_label("特徴値 (低→高)")
+    cb.set_ticks([0, 1])
+    cb.set_ticklabels(["低", "高"])
+    fig.tight_layout()
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+    print(f"SHAP summary plot を保存: {path}（特徴 上位{L}）")
+    return path
+
+
 def compare_reduced_model(df, full_feats, top_feats, cv_full=None, **cv_kwargs):
     """フル特徴 vs 上位特徴のみ で、全fold併合の総合評価(C-index/AUC/AP/lift@10%)を比較。
     cv_full に既存の train_aft_forward_cv 結果を渡せば、フル側は再学習せず流用する。"""
@@ -1037,6 +1188,14 @@ if __name__ == "__main__":
     print()
     shap_dependence_plots(
         cv, labeled, feats, top_k=4, path="/home/claude/shap_dependence.png"
+    )
+    shap_summary_plot(
+        cv,
+        labeled,
+        feats,
+        top=4,
+        shap_sample=3000,
+        path="/home/claude/shap_summary.png",
     )
 
     # 上位特徴のみで組み直した軽量モデルと、フル特徴の精度比較
